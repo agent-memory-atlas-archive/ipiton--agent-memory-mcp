@@ -44,6 +44,13 @@ func newVectorService(cfg vecServiceConfig, logger *zap.Logger) (*vectorService,
 func (vs *vectorService) search(ctx context.Context, query searchQuery) (*SearchResponse, error) {
 	startTime := time.Now()
 
+	// Pick up an index written by another process (the post-commit indexing
+	// run) before searching, instead of answering from the copy loaded when
+	// this process started.
+	if _, err := vs.store.RefreshIfStale(); err != nil {
+		return nil, fmt.Errorf("failed to refresh index before search: %w", err)
+	}
+
 	queryResult, err := vs.config.Embedder.EmbedQueryDetailed(ctx, query.Query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to embed query: %w", err)

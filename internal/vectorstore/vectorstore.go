@@ -25,6 +25,7 @@ type Store interface {
 	DeleteByDocPath(docPath string) error
 	Search(queryEmbedding []float32, limit int) ([]SearchResult, error)
 	KeywordSearch(query string, limit int) ([]SearchResult, error)
+	RefreshIfStale() (bool, error)
 	AllChunks() ([]Chunk, error)
 	ChunksByDocPath(docPath string) ([]Chunk, error)
 	Count() int
@@ -87,7 +88,18 @@ type SQLiteStore struct {
 	// mid-rune by the pre-T118 splitter. Reported so the next such share is
 	// found by a number rather than by accident.
 	invalidUTF8Chunks int
+	// loadedIndexVersion is the index version the in-memory maps were built
+	// from, so a process can tell whether someone else has re-indexed since.
+	loadedIndexVersion string
+	// refreshMu serializes the check-and-reload in RefreshIfStale so parallel
+	// searches do not each rebuild the same maps.
+	refreshMu sync.Mutex
 }
+
+// indexVersionKey is the metadata key the indexer stamps in the same
+// transaction that marks the index ready, so it never names a half-written
+// index.
+const indexVersionKey = "last_indexed"
 
 // NewSQLiteStore creates a new SQLite-backed vector store with the given embedding dimension.
 func NewSQLiteStore(dbPath string, dimension int, logger *zap.Logger) (*SQLiteStore, error) {
@@ -196,6 +208,12 @@ func (s *SQLiteStore) validateDimension(dimension int) error {
 }
 
 func (s *SQLiteStore) loadChunksToMemory() error {
+	// Read the version before the rows. If an indexing run commits in between,
+	// the stamp kept here is the older one and the next search reloads once
+	// more; the reverse order would record a version newer than the data and
+	// the update would be missed for good.
+	version := s.readIndexVersion()
+
 	rows, err := s.db.Query(`
 		SELECT id, doc_path, content, title, last_modified, embedding
 		FROM chunks
@@ -257,8 +275,61 @@ func (s *SQLiteStore) loadChunksToMemory() error {
 		s.indexChunkKeywordsLocked(&chunk)
 	}
 	s.invalidUTF8Chunks = invalid
+	s.loadedIndexVersion = version
 
 	return rows.Err()
+}
+
+// readIndexVersion returns the version stamped by the last completed indexing
+// run, or "" when the index has never been stamped or the row cannot be read.
+// An unreadable version deliberately reads as "changed" rather than
+// "unchanged": a lost stamp must not be able to pin a process to a stale copy.
+func (s *SQLiteStore) readIndexVersion() string {
+	value, err := s.GetMetadata(indexVersionKey)
+	if err != nil {
+		return ""
+	}
+	return value
+}
+
+// RefreshIfStale reloads the in-memory copy when another process has re-indexed
+// since this one loaded it, and reports whether a reload happened.
+//
+// Search answers from maps built when the store was opened, but the database is
+// written by a different process — the indexing run the git hook starts after a
+// commit. Without this check a long-lived process (an MCP session, the resident
+// HTTP instance) keeps answering from the snapshot it started with: the commit
+// is in vectors.db, absent from the results, and nothing says so. Signals could
+// not close that gap because they only reach the processes someone remembered
+// to address.
+//
+// The cost when nothing changed is one primary-key lookup of a single metadata
+// row; the reload runs only when the version actually moved.
+func (s *SQLiteStore) RefreshIfStale() (bool, error) {
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
+
+	current := s.readIndexVersion()
+
+	s.mu.RLock()
+	loaded := s.loadedIndexVersion
+	s.mu.RUnlock()
+
+	if current == loaded {
+		return false, nil
+	}
+
+	if err := s.loadChunksToMemory(); err != nil {
+		return false, fmt.Errorf("failed to reload chunks after index change: %w", err)
+	}
+
+	s.logger.Info("Reloaded in-memory index after external re-indexing",
+		zap.String("previous_version", loaded),
+		zap.String("current_version", current),
+		zap.Int("chunks", s.Count()),
+	)
+
+	return true, nil
 }
 
 // sanitizeUTF8 replaces invalid byte sequences with U+FFFD, leaving valid input
