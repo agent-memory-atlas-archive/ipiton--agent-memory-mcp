@@ -412,6 +412,7 @@ func runStats(args []string) error {
 func runReembed(args []string) error {
 	ctx := newCommandCtx("reembed", args)
 	jsonOut := ctx.fs.Bool("json", false, "Output as JSON")
+	truncated := ctx.fs.Bool("truncated", false, "Also re-embed rows whose vector covers only the opening of the body (after raising the encoder batch)")
 	if err := ctx.parse(args); err != nil {
 		return err
 	}
@@ -421,7 +422,11 @@ func runReembed(args []string) error {
 	}
 	defer ctx.close()
 
-	result, err := ctx.store.ReembedAll(context.Background())
+	reembed := ctx.store.ReembedAll
+	if *truncated {
+		reembed = ctx.store.ReembedTruncated
+	}
+	result, err := reembed(context.Background())
 	if err != nil {
 		return err
 	}

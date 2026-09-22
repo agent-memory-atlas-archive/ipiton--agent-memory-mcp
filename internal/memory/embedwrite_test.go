@@ -211,3 +211,48 @@ func TestReembedAllClearsStaleTruncationMark(t *testing.T) {
 		t.Errorf("stale %s survived a whole-body re-embed", MetadataEmbeddingTruncated)
 	}
 }
+
+// A row embedded from its opening already carries the current model id, so the
+// startup pass must leave it alone; ReembedTruncated, run after the batch is
+// raised, encodes it whole and clears the mark.
+func TestReembedTruncatedRevisitsPartialVectors(t *testing.T) {
+	store, emb := newSizeLimitedStore(t, embedRetryRunes)
+	ctx := context.Background()
+
+	m := &Memory{
+		Title:   "Session close / длинная сводка",
+		Content: strings.Repeat("длинный разбор инцидента. ", 2000),
+		Type:    TypeEpisodic,
+	}
+	if err := store.Store(ctx, m); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+
+	emb.calls = nil
+	result, err := store.ReembedAll(ctx)
+	if err != nil {
+		t.Fatalf("ReembedAll: %v", err)
+	}
+	if result.Reembedded != 0 || len(emb.calls) != 1 {
+		t.Fatalf("startup pass touched a partial row: Reembedded=%d calls=%v, want 0 and only the probe", result.Reembedded, emb.calls)
+	}
+
+	emb.maxRunes = 1 << 20 // the batch was raised
+	result, err = store.ReembedTruncated(ctx)
+	if err != nil {
+		t.Fatalf("ReembedTruncated: %v", err)
+	}
+	if result.Reembedded != 1 {
+		t.Fatalf("Reembedded = %d, want 1", result.Reembedded)
+	}
+	got, err := store.Get(m.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, ok := got.Metadata[MetadataEmbeddingTruncated]; ok {
+		t.Error("truncation mark survived a whole-body re-embed")
+	}
+	if got := store.CountTruncatedEmbedding(); got != 0 {
+		t.Errorf("CountTruncatedEmbedding() = %d, want 0", got)
+	}
+}
