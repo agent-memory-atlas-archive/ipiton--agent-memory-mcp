@@ -775,6 +775,19 @@ type ReembedResult struct {
 // ctx is honoured between rows, so a cancelled context stops the walk instead
 // of running it to the end of the bank.
 func (ms *Store) ReembedAll(ctx context.Context) (*ReembedResult, error) {
+	return ms.reembed(ctx, false)
+}
+
+// ReembedTruncated is ReembedAll plus the rows whose vector covers only the
+// opening of their body (MetadataEmbeddingTruncated). Meant to be run by hand
+// after the encoder's batch is raised: those rows already carry the current
+// model id, so ReembedAll never revisits them. Not part of the startup pass —
+// a body that still does not fit would be re-encoded on every start.
+func (ms *Store) ReembedTruncated(ctx context.Context) (*ReembedResult, error) {
+	return ms.reembed(ctx, true)
+}
+
+func (ms *Store) reembed(ctx context.Context, includeTruncated bool) (*ReembedResult, error) {
 	if ms.embedder == nil {
 		return nil, fmt.Errorf("embedder not available")
 	}
@@ -798,7 +811,8 @@ func (ms *Store) ReembedAll(ctx context.Context) (*ReembedResult, error) {
 			return result, err
 		}
 
-		if m.EmbeddingModel == probe.ModelID && len(m.Embedding) > 0 {
+		partial := includeTruncated && m.Metadata[MetadataEmbeddingTruncated] == "true"
+		if m.EmbeddingModel == probe.ModelID && len(m.Embedding) > 0 && !partial {
 			result.AlreadyCurrent++
 			continue
 		}
