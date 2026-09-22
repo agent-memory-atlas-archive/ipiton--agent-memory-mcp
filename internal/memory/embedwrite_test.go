@@ -142,3 +142,72 @@ func TestNormalBodyEmbedsOnceUnmarked(t *testing.T) {
 		t.Error("a fully embedded record was marked as truncated")
 	}
 }
+
+// ReembedAll must take the same refusal path as a write. It used to call the
+// encoder directly: every session summary above the physical batch failed on
+// each startup and kept its stale model id, so recall never reached its
+// cosine. In the Moving bank that was 142 of 327 records.
+func TestReembedAllRetriesOversizeBodyOnItsOpening(t *testing.T) {
+	store, emb := newSizeLimitedStore(t, embedRetryRunes)
+	ctx := context.Background()
+
+	m := &Memory{
+		Title:          "Session close / сводка из другого банка",
+		Content:        strings.Repeat("длинный разбор инцидента. ", 2000),
+		Type:           TypeEpisodic,
+		Embedding:      []float32{1, 0, 0},
+		EmbeddingModel: "legacy:model:3",
+	}
+	if err := store.Store(ctx, m); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	emb.calls = nil
+
+	result, err := store.ReembedAll(ctx)
+	if err != nil {
+		t.Fatalf("ReembedAll: %v", err)
+	}
+	if result.Reembedded != 1 || result.Failed != 0 {
+		t.Fatalf("Reembedded=%d Failed=%d (%v), want 1/0", result.Reembedded, result.Failed, result.FailedByID)
+	}
+
+	got, err := store.Get(m.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got.EmbeddingModel != "test-model" {
+		t.Errorf("EmbeddingModel = %q, want test-model", got.EmbeddingModel)
+	}
+	if got.Metadata[MetadataEmbeddingTruncated] != "true" {
+		t.Errorf("metadata %s = %q, want \"true\"", MetadataEmbeddingTruncated, got.Metadata[MetadataEmbeddingTruncated])
+	}
+}
+
+// A re-embed that fits whole clears a truncation mark left by an earlier,
+// smaller batch: the mark must describe the vector the row carries now.
+func TestReembedAllClearsStaleTruncationMark(t *testing.T) {
+	store, _ := newSizeLimitedStore(t, embedRetryRunes)
+	ctx := context.Background()
+
+	m := &Memory{
+		Title:          "Короткая запись",
+		Content:        "короткое содержательное описание",
+		Type:           TypeSemantic,
+		Embedding:      []float32{1, 0, 0},
+		EmbeddingModel: "legacy:model:3",
+		Metadata:       map[string]string{MetadataEmbeddingTruncated: "true"},
+	}
+	if err := store.Store(ctx, m); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	if _, err := store.ReembedAll(ctx); err != nil {
+		t.Fatalf("ReembedAll: %v", err)
+	}
+	got, err := store.Get(m.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if _, ok := got.Metadata[MetadataEmbeddingTruncated]; ok {
+		t.Errorf("stale %s survived a whole-body re-embed", MetadataEmbeddingTruncated)
+	}
+}

@@ -811,7 +811,11 @@ func (ms *Store) ReembedAll(ctx context.Context) (*ReembedResult, error) {
 			continue
 		}
 
-		embedResult, err := ms.embedder.EmbedDetailed(ctx, full.Content)
+		// Same refusal path as a write: a long session summary exceeds the
+		// encoder's physical batch, and without the prefix retry it failed on
+		// every startup and stayed under a stale model id — out of cosine
+		// recall for good.
+		embedResult, truncated, err := ms.embedForWrite(ctx, m.ID, full.Content)
 		if err != nil {
 			result.Failed++
 			result.FailedByID[m.ID] = err.Error()
@@ -822,7 +826,7 @@ func (ms *Store) ReembedAll(ctx context.Context) (*ReembedResult, error) {
 			return nil, fmt.Errorf("embedding model changed during re-embed: started with %s, then got %s", result.CurrentModel, embedResult.ModelID)
 		}
 
-		if err := ms.updateStoredEmbedding(m.ID, embedResult.Embedding, embedResult.ModelID); err != nil {
+		if err := ms.updateStoredEmbedding(m.ID, embedResult.Embedding, embedResult.ModelID, truncated); err != nil {
 			result.Failed++
 			result.FailedByID[m.ID] = err.Error()
 			continue
@@ -864,7 +868,7 @@ func (ms *Store) BackdateForTest(id string, createdAt time.Time, accessCount int
 	return ms.loadMemoriesToCache()
 }
 
-func (ms *Store) updateStoredEmbedding(id string, embedding []float32, embeddingModel string) error {
+func (ms *Store) updateStoredEmbedding(id string, embedding []float32, embeddingModel string, truncated bool) error {
 	ms.writeMu.Lock()
 	defer ms.writeMu.Unlock()
 
@@ -876,6 +880,11 @@ func (ms *Store) updateStoredEmbedding(id string, embedding []float32, embedding
 	updated.EmbeddingModel = embeddingModel
 	updated.Embedding = make([]float32, len(embedding))
 	copy(updated.Embedding, embedding)
+	if truncated {
+		markEmbeddingTruncated(updated)
+	} else {
+		delete(updated.Metadata, MetadataEmbeddingTruncated)
+	}
 	updated.UpdatedAt = ms.now()
 	if err := updateMemoryRow(ms.db, updated); err != nil {
 		return fmt.Errorf("failed to update embedding: %w", err)
