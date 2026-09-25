@@ -101,6 +101,15 @@ type SQLiteStore struct {
 // index.
 const indexVersionKey = "last_indexed"
 
+// indexGenerationKey is a counter bumped in every transaction that publishes a
+// change to the chunks: the final index commit and an orphan sweep that
+// removed something. last_indexed alone has one-second resolution, so two runs
+// finishing within the same second left the stamp unchanged and a reader that
+// reloaded between them missed the second. The counter does not depend on the
+// clock; last_indexed stays part of the version so a store indexed by a build
+// that predates the counter is still noticed.
+const indexGenerationKey = "index_generation"
+
 // NewSQLiteStore creates a new SQLite-backed vector store with the given embedding dimension.
 func NewSQLiteStore(dbPath string, dimension int, logger *zap.Logger) (*SQLiteStore, error) {
 	db, err := dbutil.OpenSQLite(dbPath, logger)
@@ -285,11 +294,48 @@ func (s *SQLiteStore) loadChunksToMemory() error {
 // An unreadable version deliberately reads as "changed" rather than
 // "unchanged": a lost stamp must not be able to pin a process to a stale copy.
 func (s *SQLiteStore) readIndexVersion() string {
-	value, err := s.GetMetadata(indexVersionKey)
+	return readIndexVersionFrom(s.db)
+}
+
+// readIndexVersionFrom reads the version through db or through an open
+// transaction, so a writer can see the version on both sides of its own change.
+func readIndexVersionFrom(q interface {
+	QueryRow(query string, args ...any) *sql.Row
+}) string {
+	var generation, stamp sql.NullString
+	err := q.QueryRow(`
+		SELECT
+			(SELECT value FROM index_metadata WHERE key = ?),
+			(SELECT value FROM index_metadata WHERE key = ?)
+	`, indexGenerationKey, indexVersionKey).Scan(&generation, &stamp)
 	if err != nil {
 		return ""
 	}
-	return value
+	return generation.String + "|" + stamp.String
+}
+
+// bumpIndexGeneration advances the generation inside tx and returns the
+// resulting version. The caller reads the version before at the start of the
+// same transaction, ahead of its own writes (which may include last_indexed).
+func bumpIndexGeneration(tx *sql.Tx) (string, error) {
+	if _, err := tx.Exec(`
+		INSERT INTO index_metadata (key, value) VALUES (?, '1')
+		ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + 1
+	`, indexGenerationKey); err != nil {
+		return "", fmt.Errorf("failed to bump index generation: %w", err)
+	}
+	return readIndexVersionFrom(tx), nil
+}
+
+// adoptIndexVersionLocked records this process's own published change as
+// loaded, sparing it a full reload of maps it has already updated in place.
+// Only when it was current just before its change: if another process
+// published in between, the versions differ and RefreshIfStale reloads.
+// The caller holds s.mu.
+func (s *SQLiteStore) adoptIndexVersionLocked(before, after string) {
+	if before != "" && s.loadedIndexVersion == before {
+		s.loadedIndexVersion = after
+	}
 }
 
 // RefreshIfStale reloads the in-memory copy when another process has re-indexed
