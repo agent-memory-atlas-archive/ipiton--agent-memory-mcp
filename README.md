@@ -693,7 +693,7 @@ For shared HTTP mode:
 | `config` | Generate ready MCP client config snippets |
 | `project-bank` | Show structured project bank views (`canonical_overview`, `decisions`, `runbooks`, `incidents`, `caveats`, `migrations`, `review_queue`) |
 | `resolve-review-item` | Resolve a pending review queue item (`<id>`, `-resolution`, `-note`, `-owner`, `-json`) |
-| `reembed` | Re-generate memory embeddings with the active model (`-json`) |
+| `reembed` | Re-generate memory embeddings with the active model (`-json`; `-truncated` also re-encodes vectors built from a body's opening) |
 | `export` | Export all memories to JSON (`-o` file, default stdout) |
 | `import` | Import memories from JSON (positional file or stdin) |
 | `index-triples` | Retrofit (subj, rel, obj) triples for memories that lack them (`-resume`, `-force`, `-limit`, `-context`, `-dry-run`, `-progress-every`, `-json`). Powers the `recall_multihop` MCP tool — see `MCP_TRIPLE_EXTRACTOR_*` envs. |

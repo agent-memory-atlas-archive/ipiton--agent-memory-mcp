@@ -5,6 +5,35 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.4] - 2026-09-25
+
+Two ways a vector went missing, and one way the RAG index went out of date
+without a word. None of them raised an error: records were stored, searches
+returned results, and the gaps showed up only when someone went looking.
+
+### Added
+
+- **`reembed --truncated`** — re-encodes records whose vector was built from the opening of the body (`embedding_truncated`) and clears the mark on the ones that now fit whole. These records already carry the current model id, so a plain `reembed` never revisits them once the encoder's batch has been raised. It is not part of the startup pass on purpose: a body that still does not fit would be re-encoded on every start.
+
+### Fixed
+
+- **Long-running processes kept answering from a stale RAG index** — search runs against maps built when the store opens, but `vectors.db` is written by a different process: the indexing run the git hook starts after a commit. An MCP session or the resident HTTP instance therefore kept its startup snapshot: the commit was in the database and missing from the results. SIGHUP only covered the resident instance, and only by accident. Before each search the store now compares the index version it loaded with the one in the database and re-reads the chunks when the version has moved. When nothing changed this costs one metadata lookup.
+
+  The version is an `index_generation` counter bumped in the transaction that publishes the index, not `last_indexed` alone: that stamp has one-second resolution, so two runs finishing within the same second looked like one. An orphan sweep that removes chunks after the publish bumps the counter too. The process that did the indexing takes the new version without reloading, because it already updated its maps in place, unless another process published in between.
+
+- **`reembed` failed on long records at every start** — `ReembedAll` called the encoder directly and skipped the prefix retry that writes got in T120. Session summaries larger than llama-server's physical batch failed on every startup and kept a stale model id, which left recall scoring them by text only. The re-embed now uses the write path and sets or clears `embedding_truncated` to match the stored vector. Failures now log the record id, where previously a startup pass reported `"failed": 38` and logged no ids.
+
+- **A bulk `merge_duplicates` could silence the encoder for an hour** — the merge also called the encoder directly. A merged primary is the concatenation of every duplicate, so the encoder refused it; three refusals in a row tripped the llama.cpp circuit breaker, and on 2026-09-25 a merge of ~104 session-close groups left 85 primaries, plus every unrelated write in the following hour, without a vector.
+  - The merge now goes through the write path and sets `embedding_truncated` to match its new vector.
+  - A refusal for input size (413, or a body saying "too large" / "context length"; llama-server answers such inputs with 500) no longer counts toward the breaker: the provider answered, and the same input would be refused on every retry.
+  - Local providers (llama.cpp, Ollama) now cool down for one minute instead of an hour.
+  - The error when every provider fails now names the providers that were tried and the breakers that are open. It used to advise configuring JINA/OpenAI/Ollama whatever the actual cause.
+  - The server's embedder writes to the file log, so provider failures and breaker trips show up in diagnostics.
+
+- **Merged bodies could outgrow what `update_memory` accepts** — the merge budget was 256K runes, while `update_memory` limits content to 100 000 bytes. A merged primary reached 262 KB, and after that no edit of it passed through the tool. Merges now cap at the same 100 000 bytes, cutting on a rune boundary. ⚠️ Records merged before this release keep their size and need a manual trim.
+
+- **Review-queue items got a vector on every re-embed (T84)** — these items are stored without a vector on purpose. `ReembedAll` compared only model ids, so it embedded them anyway (49 on 2026-09-25), and their empty model id re-triggered the startup re-embed on every start. Both the re-embed and the startup check now skip them; the CLI reports how many were skipped. ⚠️ Items that already received a vector keep it.
+
 ## [0.13.3] - 2026-09-04
 
 Six defects, four of them in what the hooks write down. The pattern they share

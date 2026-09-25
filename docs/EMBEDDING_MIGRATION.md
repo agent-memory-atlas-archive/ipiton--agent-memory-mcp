@@ -87,6 +87,13 @@ If you care about those records, the fix is upstream of the encoder: chunk them
 at write time or refuse to store them, rather than raising `-ub` until the
 largest one fits.
 
+Since T120 a refused body is embedded from its opening instead, and the record
+is marked `embedding_truncated`: it takes part in semantic recall, scored by its
+first part. Writes, merges and `reembed` all take that path. Such a record
+already carries the current model id, so a plain `reembed` never revisits it —
+after raising `-ub`, run `agent-memory-mcp reembed --truncated` to re-encode the
+marked records and clear the mark on the ones that now fit whole.
+
 ## Verifying the migration
 
 ```sh
