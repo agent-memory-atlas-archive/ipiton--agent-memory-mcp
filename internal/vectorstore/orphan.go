@@ -49,6 +49,7 @@ func (s *SQLiteStore) CleanOrphans() (int, error) {
 		return 0, fmt.Errorf("failed to begin orphan cleanup transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
+	before := readIndexVersionFrom(tx)
 
 	stmt, err := tx.Prepare("DELETE FROM chunks WHERE id = ?")
 	if err != nil {
@@ -62,6 +63,14 @@ func (s *SQLiteStore) CleanOrphans() (int, error) {
 		}
 	}
 
+	// The sweep runs after the index commit has published its version, so a
+	// reader that reloaded in between holds the orphans this deletes. Publish
+	// the deletion too.
+	after, err := bumpIndexGeneration(tx)
+	if err != nil {
+		return 0, err
+	}
+
 	if err := tx.Commit(); err != nil {
 		return 0, fmt.Errorf("failed to commit orphan cleanup: %w", err)
 	}
@@ -72,6 +81,7 @@ func (s *SQLiteStore) CleanOrphans() (int, error) {
 		s.removeChunkKeywordsLocked(id)
 		delete(s.chunks, id)
 	}
+	s.adoptIndexVersionLocked(before, after)
 	s.mu.Unlock()
 
 	s.logger.Info("Cleaned orphan chunks", zap.Int("count", len(orphanIDs)))

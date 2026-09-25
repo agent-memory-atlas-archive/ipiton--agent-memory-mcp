@@ -44,6 +44,15 @@ func (s *SQLiteStore) CommitIndexState(update IndexStateUpdate) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// Only the commit that publishes a finished index (it carries last_indexed)
+	// advances the generation; marking the index dirty at the start of a run
+	// must not send readers to reload a half-written one.
+	_, publishing := update.Metadata[indexVersionKey]
+	var before, after string
+	if publishing {
+		before = readIndexVersionFrom(tx)
+	}
+
 	for key, value := range update.Metadata {
 		if _, err := tx.Exec(`
 			INSERT OR REPLACE INTO index_metadata (key, value) VALUES (?, ?)
@@ -67,8 +76,20 @@ func (s *SQLiteStore) CommitIndexState(update IndexStateUpdate) error {
 		}
 	}
 
+	if publishing {
+		if after, err = bumpIndexGeneration(tx); err != nil {
+			return err
+		}
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("failed to commit index state transaction: %w", err)
+	}
+
+	if after != "" {
+		s.mu.Lock()
+		s.adoptIndexVersionLocked(before, after)
+		s.mu.Unlock()
 	}
 
 	return nil
