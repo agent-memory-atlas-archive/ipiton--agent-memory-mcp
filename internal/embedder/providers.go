@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -58,7 +59,7 @@ func (e *Embedder) postJSON(ctx context.Context, url string, headers map[string]
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("returned status %d: %s", resp.StatusCode, sanitizeErrorBody(body))
+		return &providerStatusError{status: resp.StatusCode, body: sanitizeErrorBody(body)}
 	}
 	if out == nil {
 		return nil
@@ -67,6 +68,40 @@ func (e *Embedder) postJSON(ctx context.Context, url string, headers map[string]
 		return fmt.Errorf("failed to decode response: %w", err)
 	}
 	return nil
+}
+
+// providerStatusError is a non-200 answer: the provider was reached and replied.
+type providerStatusError struct {
+	status int
+	body   string
+}
+
+func (e *providerStatusError) Error() string {
+	return fmt.Sprintf("returned status %d: %s", e.status, e.body)
+}
+
+// isInputRejection reports whether the provider refused this particular input
+// for its size, as opposed to failing as a service. Such a refusal says
+// nothing about the provider's health — it answered, and the same input will
+// be refused on every attempt — so it must not count toward the circuit
+// breaker. It did: a bulk merge of long session summaries produced three
+// refusals in a row and took the only local encoder out for an hour
+// (2026-09-25).
+//
+// The status code alone cannot tell: llama-server answers an input larger than
+// its physical batch with 500 ("input (40003 tokens) is too large to
+// process"), so the body is matched too. Deliberately narrow — a 400 for a
+// wrong model name or a bad key is a configuration fault and should still trip.
+func isInputRejection(err error) bool {
+	var se *providerStatusError
+	if !errors.As(err, &se) {
+		return false
+	}
+	if se.status == http.StatusRequestEntityTooLarge {
+		return true
+	}
+	body := strings.ToLower(se.body)
+	return strings.Contains(body, "too large") || strings.Contains(body, "context length")
 }
 
 func singleEmbeddingFromCompatibleResponse(provider string, response compatibleEmbeddingsResponse) ([]float32, error) {

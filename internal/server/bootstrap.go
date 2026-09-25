@@ -82,7 +82,15 @@ func initMemoryStore(cfg config.Config, fileLogger *logger.FileLogger) (*memory.
 		fmt.Fprintf(os.Stderr, "warning: failed to create memory store directory: %v\n", err)
 	}
 
-	emb, err := embedder.New(cfg.EmbedderConfig(), zap.NewNop())
+	// Same T120 lesson as the store below: with a Nop logger the provider
+	// failures and the breaker trip ("disabled after repeated failures") never
+	// reached the log, so on 2026-09-25 an hour without vectors showed up only
+	// as a misleading "configure at least one of …" on the caller's side.
+	embedderLogger := zap.NewNop()
+	if fileLogger != nil {
+		embedderLogger = fileLogger.Logger
+	}
+	emb, err := embedder.New(cfg.EmbedderConfig(), embedderLogger)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: embedder unavailable, memory will use text-only matching: %v\n", err)
 		if fileLogger != nil {

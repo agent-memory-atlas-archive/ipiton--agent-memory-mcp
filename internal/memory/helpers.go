@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode/utf8"
+
+	"github.com/ipiton/agent-memory-mcp/internal/textfmt"
 )
 
 // parseMetadataJSON unmarshals a metadata blob from a sql.NullString into
@@ -134,8 +135,17 @@ func joinCSVUnique(values ...[]string) string {
 	return strings.Join(UnionStrings(values...), ",")
 }
 
-// maxMergedContentLen limits merged content to prevent unbounded growth during merge operations.
-const maxMergedContentLen = 256 * 1024
+// MaxMergedContentBytes caps the body a merge may produce. It equals
+// userio.MaxMemoryContentLen, the limit update_memory enforces — and that check
+// counts bytes, not runes. The old budget was 256K runes: a merged "Session
+// close" primary reached 262 KB, update_memory then refused every edit of it
+// ("content too long"), and the record could no longer be repaired through the
+// tool. A merge must not produce a body the write boundary would reject.
+// (memory cannot import userio — userio imports memory — so the equality is
+// asserted by a test on the userio side.)
+const MaxMergedContentBytes = 100000
+
+const mergedContentTruncatedSuffix = "\n[truncated: merged content exceeded size limit]"
 
 func mergeContent(primary string, duplicates []*Memory) string {
 	content := strings.TrimSpace(primary)
@@ -156,10 +166,11 @@ func mergeContent(primary string, duplicates []*Memory) string {
 		} else {
 			content += "\n\nMerged note:\n" + duplicateContent
 		}
-		// Rune-aware: a byte slice content[:n] can split a multibyte rune and
-		// persist invalid UTF-8 (T87). maxMergedContentLen is a rune budget.
-		if utf8.RuneCountInString(content) > maxMergedContentLen {
-			content = truncateRunesSuffix(content, maxMergedContentLen, "\n[truncated: merged content exceeded size limit]")
+		if len(content) > MaxMergedContentBytes {
+			// Cut on a rune boundary: a bare content[:n] can split a multibyte
+			// rune and persist invalid UTF-8 (T87).
+			cut := textfmt.AlignRuneStart(content, MaxMergedContentBytes-len(mergedContentTruncatedSuffix))
+			content = content[:cut] + mergedContentTruncatedSuffix
 			break
 		}
 	}

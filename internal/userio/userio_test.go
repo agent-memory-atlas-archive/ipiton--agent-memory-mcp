@@ -102,3 +102,13 @@ func TestFormatTrustWrappers(t *testing.T) {
 		}
 	}
 }
+
+// A merge must not produce a body update_memory would refuse: memory cannot
+// import this package (the import runs the other way), so the two limits are
+// held equal here.
+func TestMergedContentLimitMatchesUpdateLimit(t *testing.T) {
+	if memory.MaxMergedContentBytes != MaxMemoryContentLen {
+		t.Fatalf("memory.MaxMergedContentBytes = %d, MaxMemoryContentLen = %d — a merged record would be uneditable",
+			memory.MaxMergedContentBytes, MaxMemoryContentLen)
+	}
+}

@@ -558,13 +558,22 @@ func (ms *Store) MergeDuplicates(ctx context.Context, primaryID string, duplicat
 	if updatedPrimary.Content != primary.Content {
 		updatedPrimary.Embedding = nil
 		updatedPrimary.EmbeddingModel = ""
+		// The old vector's partiality mark describes a vector that is gone.
+		delete(updatedPrimary.Metadata, MetadataEmbeddingTruncated)
 		if ms.embedder != nil {
-			result, err := ms.embedder.EmbedDetailed(ctx, updatedPrimary.Content)
-			if err != nil {
-				ms.logger.Warn("Failed to re-generate embedding for merged memory", zap.String("id", primaryID), zap.Error(err))
-			} else {
+			// Same refusal path as a write. Calling the encoder directly skipped
+			// the prefix retry: a merged body is the concatenation of every
+			// duplicate, so the encoder refused it, and on a bulk merge three
+			// refusals in a row tripped the provider's breaker for an hour —
+			// 85 primaries and every unrelated write of that hour went without
+			// a vector (2026-09-25).
+			result, truncated, err := ms.embedForWrite(ctx, primaryID, updatedPrimary.Content)
+			if err == nil {
 				updatedPrimary.Embedding = result.Embedding
 				updatedPrimary.EmbeddingModel = result.ModelID
+				if truncated {
+					markEmbeddingTruncated(updatedPrimary)
+				}
 			}
 		}
 	}
@@ -820,6 +829,10 @@ func (ms *Store) reembed(ctx context.Context, includeTruncated bool) (*ReembedRe
 		// We need content for re-embedding
 		full, err := ms.Get(m.ID)
 		if err != nil {
+			// embedForWrite logs its own refusals; these two paths did not, so
+			// the startup pass reported "failed":38 with no id anywhere in the
+			// log and the cause could not be told apart afterwards.
+			ms.logger.Warn("Re-embed could not read a record", zap.String("id", m.ID), zap.Error(err))
 			result.Failed++
 			result.FailedByID[m.ID] = err.Error()
 			continue
@@ -841,6 +854,7 @@ func (ms *Store) reembed(ctx context.Context, includeTruncated bool) (*ReembedRe
 		}
 
 		if err := ms.updateStoredEmbedding(m.ID, embedResult.Embedding, embedResult.ModelID, truncated); err != nil {
+			ms.logger.Warn("Re-embed could not store a vector", zap.String("id", m.ID), zap.Error(err))
 			result.Failed++
 			result.FailedByID[m.ID] = err.Error()
 			continue
