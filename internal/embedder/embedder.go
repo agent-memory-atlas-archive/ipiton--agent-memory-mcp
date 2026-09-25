@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -242,7 +243,7 @@ func (e *Embedder) embedWithTaskDetailed(ctx context.Context, text string, task 
 	if e.localOnlyMode() {
 		return nil, fmt.Errorf("local-only embedding mode failed: start Ollama at %s and pull bge-m3 or mxbai-embed-large, or disable MCP_EMBEDDING_MODE=local-only", e.config.OllamaBaseURL)
 	}
-	return nil, fmt.Errorf("all embedding providers failed: configure at least one of JINA_API_KEY, OPENAI_API_KEY, or OLLAMA_BASE_URL")
+	return nil, e.exhaustedError("embedding", fallbacks)
 }
 
 // BatchEmbed generates vector embeddings for multiple texts using native batch APIs.
@@ -311,7 +312,26 @@ func (e *Embedder) batchEmbedWithTaskDetailed(ctx context.Context, texts []strin
 	if e.localOnlyMode() {
 		return nil, fmt.Errorf("local-only batch embedding failed: start Ollama at %s and pull bge-m3 or mxbai-embed-large, or disable MCP_EMBEDDING_MODE=local-only", e.config.OllamaBaseURL)
 	}
-	return nil, fmt.Errorf("all batch embedding providers failed: configure at least one of JINA_API_KEY, OPENAI_API_KEY, or OLLAMA_BASE_URL")
+	return nil, e.exhaustedError("batch embedding", fallbacks)
+}
+
+// exhaustedError says why no provider produced a vector. It used to advise
+// "configure at least one of JINA_API_KEY, OPENAI_API_KEY, or OLLAMA_BASE_URL"
+// whatever happened — including when llama.cpp was configured and merely
+// skipped by its open breaker, which sent the reader to fix a configuration
+// that was fine.
+func (e *Embedder) exhaustedError(kind string, tried []string) error {
+	open := e.openBreakers()
+	switch {
+	case len(tried) == 0 && len(open) == 0:
+		return fmt.Errorf("no %s provider configured: set LLAMACPP_BASE_URL, OLLAMA_BASE_URL, JINA_API_KEY or OPENAI_API_KEY", kind)
+	case len(open) == 0:
+		return fmt.Errorf("all %s providers failed (tried: %s)", kind, strings.Join(tried, ", "))
+	case len(tried) == 0:
+		return fmt.Errorf("all %s providers unavailable: circuit breaker open for %s after repeated failures", kind, strings.Join(open, ", "))
+	default:
+		return fmt.Errorf("all %s providers failed (tried: %s; circuit breaker open for %s)", kind, strings.Join(tried, ", "), strings.Join(open, ", "))
+	}
 }
 
 func (e *Embedder) ensureReady() error {
@@ -348,7 +368,10 @@ func (e *Embedder) candidates(task string) []providerCandidate {
 		out = append(out, providerCandidate{
 			provider:  p,
 			onSuccess: h.markSuccess,
-			onFailure: func(error) {
+			onFailure: func(err error) {
+				if isInputRejection(err) {
+					return
+				}
 				if h.markFailure() {
 					fields := []zap.Field{
 						zap.String("provider", name),
@@ -413,6 +436,13 @@ const (
 	// open before one retry is allowed.
 	providerFailureThreshold = 3
 	providerDisableCooldown  = time.Hour
+	// localProviderDisableCooldown applies to llama.cpp and Ollama. The hour
+	// protects a hosted provider's quota and our latency; a local one has no
+	// quota, a failed call to it costs a refused connection, and it is often
+	// the only encoder configured — so an hour open is an hour of writes stored
+	// without a vector, while the usual cause (the server restarting) is over
+	// in seconds.
+	localProviderDisableCooldown = time.Minute
 )
 
 // providerHealth is a per-provider circuit breaker shared by every embedding
@@ -422,6 +452,7 @@ type providerHealth struct {
 	mu            sync.Mutex
 	errorCount    int
 	disabledUntil time.Time
+	cooldown      time.Duration // zero means providerDisableCooldown
 }
 
 // available reports whether the provider may be tried now. When the cooldown has
@@ -455,10 +486,22 @@ func (h *providerHealth) markFailure() bool {
 	defer h.mu.Unlock()
 	h.errorCount++
 	if h.errorCount >= providerFailureThreshold && h.disabledUntil.IsZero() {
-		h.disabledUntil = time.Now().Add(providerDisableCooldown)
+		cooldown := h.cooldown
+		if cooldown == 0 {
+			cooldown = providerDisableCooldown
+		}
+		h.disabledUntil = time.Now().Add(cooldown)
 		return true
 	}
 	return false
+}
+
+// isOpen reports whether the breaker currently keeps the provider out, without
+// the side effect available() has of re-enabling it after the cooldown.
+func (h *providerHealth) isOpen() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return !h.disabledUntil.IsZero() && time.Now().Before(h.disabledUntil)
 }
 
 // healthFor returns the circuit breaker for a provider, creating it on first use.
@@ -468,9 +511,30 @@ func (e *Embedder) healthFor(name string) *providerHealth {
 	h := e.health[name]
 	if h == nil {
 		h = &providerHealth{}
+		if isLocalProvider(name) {
+			h.cooldown = localProviderDisableCooldown
+		}
 		e.health[name] = h
 	}
 	return h
+}
+
+func isLocalProvider(name string) bool {
+	return name == "llamacpp" || strings.HasPrefix(name, "ollama/")
+}
+
+// openBreakers lists the providers their breaker currently keeps out, sorted.
+func (e *Embedder) openBreakers() []string {
+	e.healthMu.Lock()
+	defer e.healthMu.Unlock()
+	var names []string
+	for name, h := range e.health {
+		if h.isOpen() {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
 }
 
 // Dimensions returns the embedding vector dimension this Embedder produces.
