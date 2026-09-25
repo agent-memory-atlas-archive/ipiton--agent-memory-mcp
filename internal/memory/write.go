@@ -767,6 +767,7 @@ type ReembedResult struct {
 	Total              int               `json:"total"`
 	Reembedded         int               `json:"reembedded"`
 	AlreadyCurrent     int               `json:"already_current"`
+	SkippedReviewQueue int               `json:"skipped_review_queue,omitempty"`
 	Failed             int               `json:"failed"`
 	CurrentModel       string            `json:"current_model"`
 	ChangedFromByModel map[string]int    `json:"changed_from_by_model,omitempty"`
@@ -818,6 +819,14 @@ func (ms *Store) reembed(ctx context.Context, includeTruncated bool) (*ReembedRe
 	for _, m := range snapshot {
 		if err := ctx.Err(); err != nil {
 			return result, err
+		}
+
+		// T84: review-queue items are stored without a vector on purpose. The
+		// re-embed gave them one anyway — 49 of them on 2026-09-25 — and with
+		// the "(none)" model they re-armed the startup pass on every start.
+		if isReviewQueueCached(m) {
+			result.SkippedReviewQueue++
+			continue
 		}
 
 		partial := includeTruncated && m.Metadata[MetadataEmbeddingTruncated] == "true"

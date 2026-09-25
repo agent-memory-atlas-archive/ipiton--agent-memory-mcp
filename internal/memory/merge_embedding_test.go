@@ -107,3 +107,36 @@ func TestMergeContentStaysWithinTheUpdateLimit(t *testing.T) {
 		t.Error("an over-limit merge must say it was truncated")
 	}
 }
+
+// T84 keeps review-queue items vectorless; re-embed must not undo that. It
+// did — 49 of them on 2026-09-25 — because the loop only compared model ids.
+func TestReembedSkipsReviewQueueItems(t *testing.T) {
+	store, emb := newSizeLimitedStore(t, embedRetryRunes)
+	ctx := context.Background()
+
+	item := &Memory{
+		Title:    "Review queue / x",
+		Content:  "review pointer",
+		Type:     TypeWorking,
+		Metadata: map[string]string{MetadataRecordKind: RecordKindReviewQueueItem},
+	}
+	if err := store.Store(ctx, item); err != nil {
+		t.Fatalf("Store: %v", err)
+	}
+	emb.calls = nil
+
+	res, err := store.ReembedAll(ctx)
+	if err != nil {
+		t.Fatalf("ReembedAll: %v", err)
+	}
+	if res.Reembedded != 0 || res.SkippedReviewQueue != 1 {
+		t.Errorf("reembedded=%d skipped_review_queue=%d, want 0 and 1", res.Reembedded, res.SkippedReviewQueue)
+	}
+	stored, err := store.Get(item.ID)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if len(stored.Embedding) != 0 {
+		t.Error("review-queue item gained a vector")
+	}
+}

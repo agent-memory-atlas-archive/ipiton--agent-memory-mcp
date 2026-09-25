@@ -441,6 +441,9 @@ func runReembed(args []string) error {
 	}
 	fmt.Printf("Re-embedded: %d\n", result.Reembedded)
 	fmt.Printf("Already current: %d\n", result.AlreadyCurrent)
+	if result.SkippedReviewQueue > 0 {
+		fmt.Printf("Skipped (review queue, vectorless by design): %d\n", result.SkippedReviewQueue)
+	}
 	fmt.Printf("Failed: %d\n", result.Failed)
 	if len(result.ChangedFromByModel) > 0 {
 		fmt.Println("Changed from:")

@@ -938,6 +938,9 @@ func (ms *Store) maybeStartBackgroundReembed() {
 	// Collect model distribution from cache
 	modelCounts := make(map[string]int)
 	for _, m := range ms.memories {
+		if isReviewQueueCached(m) {
+			continue // vectorless by design (T84), not a stale model
+		}
 		model := m.EmbeddingModel
 		if model == "" {
 			model = "(none)"
